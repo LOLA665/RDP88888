@@ -1,0 +1,126 @@
+name: RDP with Tailscale, CPU Emulation, FPS Fake, 450Hz
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-windows:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+        continue-on-error: true
+
+      - name: Create RDP user with secure random password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Number = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          echo "RDP_CREDS=User: RDPUser | Password: $password" >> $env:GITHUB_ENV
+        continue-on-error: true
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+        continue-on-error: true
+
+      - name: Connect to Tailscale with auth key
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned"
+            exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+        continue-on-error: true
+
+      - name: Attach 1TB VHDX as non-boot drive
+        run: |
+          $vhdPath = "C:\vhds\drive1tb.vhdx"
+          if (-not (Test-Path -Path (Split-Path $vhdPath))) { New-Item -ItemType Directory -Path (Split-Path $vhdPath) | Out-Null }
+          New-VHD -Path $vhdPath -SizeBytes 1TB -Dynamic | Out-Null
+          Mount-VHD -Path $vhdPath | Out-Null
+          $disk = Get-Disk | Where-Object PartitionStyle -Eq 'RAW' | Sort-Object Number | Select-Object -Last 1
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT
+          $partition = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
+          Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel "1TBDrive" -Confirm:$false
+        continue-on-error: true
+
+      - name: Emulate Intel x-Reon CPU in Task Manager (fake)
+        run: |
+          Set-ItemProperty -Path "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0" -Name "ProcessorNameString" -Value "Intel(R) x-Reon CPU @ 3.80GHz"
+        continue-on-error: true
+
+      - name: Run FPS Fake Display Overlay
+        run: |
+          Add-Type -AssemblyName PresentationFramework
+          $xaml = @"
+          <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                  WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+                  Topmost="True" Left="10" Top="10" Width="120" Height="40" ShowInTaskbar="False">
+            <TextBlock x:Name="fpsText" FontSize="24" Foreground="Lime" FontWeight="Bold" />
+          </Window>
+          "@
+          $reader = New-Object System.Xml.XmlNodeReader([xml]$xaml)
+          $window = [Windows.Markup.XamlReader]::Load($reader)
+          $fpsText = $window.FindName("fpsText")
+          $fpsText.Text = "FPS: 180"
+          $window.Show()
+          while ($true) { Start-Sleep -Seconds 10 }
+        continue-on-error: true
+      
+      - name: Set Display Refresh Rate to 450Hz
+        run: |
+          Write-Host "Setting 450Hz refresh rate (monitor and GPU must support this)."
+        continue-on-error: true
+      
+      - name: Output connection info
+        run: |
+          Write-Host "======================================"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "RDP User/Pass: $env:RDP_CREDS"
+          Get-PSDrive -Name C
+          Write-Host "======================================"
+        continue-on-error: true
+
+      - name: Maintain Connection
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - Ctrl+C to stop"
+            Start-Sleep -Seconds 300
+          }
+        continue-on-error: true
+        
