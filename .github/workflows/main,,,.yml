@@ -1,0 +1,77 @@
+name: Create Windows Server 2025 RDP VM with Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build_vm:
+    runs-on: ubuntu-latest
+
+    env:
+      VM_USER: Administrator
+      VM_PASSWORD: YourSecurePass123!    # Folosește secret GitHub pentru producție
+      VM_NAME: ws2025-qemu
+      VM_RAM: 32G
+      VM_DISK_SIZE: 777G
+      VM_CPUS: 8
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install QEMU and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu qemu-kvm libvirt-clients libvirt-daemon-system bridge-utils virt-manager curl
+
+    - name: Create disk image for VM (777GB SSD)
+      run: |
+        qemu-img create -f qcow2 ${VM_NAME}.qcow2 ${VM_DISK_SIZE}
+
+    - name: Download Windows Server 2025 ISO
+      continue-on-error: true
+      run: |
+        wget -O ws2025.iso "https://link-reala-catre-Windows-Server-2025-ISO"
+
+    - name: Start VM with QEMU emulating Ryzen 7 CPU (32GB RAM)
+      run: |
+        qemu-system-x86_64 \
+          -name ${VM_NAME} \
+          -machine type=q35,accel=kvm \
+          -cpu EPYC-IBPB,+ssse3,+sse4.2,+aes,+xsave,+avx,+avx2,+bmi2 \
+          -smp ${VM_CPUS} \
+          -m ${VM_RAM} \
+          -drive file=${VM_NAME}.qcow2,format=qcow2,if=virtio \
+          -cdrom ws2025.iso \
+          -boot d \
+          -netdev user,id=net0,hostfwd=tcp::3389-:3389 \
+          -device virtio-net-pci,netdev=net0 \
+          -enable-kvm \
+          -daemonize
+
+    - name: Install Tailscale agent (simulat)
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname=${VM_NAME} --accept-routes
+
+    - name: Get VM Tailscale IP address
+      id: tailscaleip
+      run: |
+        IP=$(tailscale ip -4)
+        echo "TAILSCALE_IP=$IP" >> $GITHUB_ENV
+        echo "::set-output name=vm_ip::$IP"
+
+    - name: Output VM connection details
+      run: |
+        echo "====================================="
+        echo "VM Name: ${VM_NAME}"
+        echo "RDP IP (Tailscale): ${{ env.TAILSCALE_IP }}"
+        echo "User: ${VM_USER}"
+        echo "Password: ${VM_PASSWORD}"
+        echo "====================================="
+
+    - name: Keep VM running for 30 days (adjust as needed)
+      run: |
+        sleep 2592000
+        
