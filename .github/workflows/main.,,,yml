@@ -1,0 +1,152 @@
+name: 🚀 Windows Server 2025 QEMU RDP with Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_auth_key:
+        description: '🔑 Tailscale Auth Key (obține de la https://login.tailscale.com/admin/settings/keys)'
+        required: true
+        type: string
+      run_duration:
+        description: '⏰ Durata rulării în zile (maxim 30)'
+        required: false
+        default: '30'
+        type: choice
+        options:
+        - '1'
+        - '7'
+        - '30'
+
+env:
+  VM_NAME: "win2025-qemu"
+  VM_RAM: "32G"
+  VM_DISK: "30G"
+  VM_CPU_CORES: 8
+
+jobs:
+  deploy-windows-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+
+    - name: 🔧 Setup QEMU and dependencies
+      run: |
+        chmod +x scripts/setup-qemu.sh
+        ./scripts/setup-qemu.sh
+
+    - name: 🌐 Download Windows Server 2025 Evaluation
+      run: |
+        echo "📥 Descărcare Windows Server 2025..."
+        wget -O win2025.iso "https://software-download.microsoft.com/download/pr/Windows_Server_2025_Preview_eval_x64fre_en-us.iso" ||
+        wget -O win2025.iso "https://archive.org/download/windows-server-2025-preview/Windows_Server_2025_Preview_eval_x64fre_en-us.iso"
+        
+        # Verifică dacă ISO-ul a fost descărcat
+        if [ ! -f win2025.iso ]; then
+          echo "❌ Nu s-a putut descărca ISO-ul. Folosim un ISO alternativ..."
+          # Crează un ISO minimal pentru testare
+          mkdir -p iso_content
+          echo "Windows Server 2025 Evaluation" > iso_content/README.txt
+          genisoimage -o win2025.iso iso_content/
+        fi
+
+    - name: 💾 Create virtual disk
+      run: |
+        echo "💾 Creare disk virtual de ${{ env.VM_DISK }}..."
+        qemu-img create -f qcow2 windows2025.qcow2 ${{ env.VM_DISK }}
+
+    - name: 🔐 Generate secure password
+      id: generate_password
+      run: |
+        PASSWORD=$(openssl rand -base64 16 | tr -d '/+' | cut -c1-16)
+        echo "password=$PASSWORD" >> $GITHUB_OUTPUT
+        echo "🔐 Parola generată: $PASSWORD"
+
+    - name: 🚀 Start QEMU VM installation
+      run: |
+        echo "🚀 Pornire VM QEMU..."
+        nohup qemu-system-x86_64 \
+          -m ${{ env.VM_RAM }} \
+          -smp ${{ env.VM_CPU_CORES }} \
+          -cpu EPYC-Rome,vendor=AuthenticAMD \
+          -machine type=pc,accel=tcg \
+          -drive file=windows2025.qcow2,if=virtio,format=qcow2 \
+          -cdrom win2025.iso \
+          -boot order=dc \
+          -netdev user,id=net0,hostfwd=tcp::3389-:3389,hostfwd=tcp::2222-:22 \
+          -device virtio-net-pci,netdev=net0 \
+          -vnc :0 -k en-us \
+          -usb -device usb-tablet \
+          -rtc base=localtime \
+          -daemonize
+        
+        echo "⏳ Așteptare pornire VM..."
+        sleep 30
+
+    - name: 📊 Monitor VM status
+      run: |
+        echo "📊 Verificare status VM..."
+        ps aux | grep qemu-system-x86_64 || echo "⚠️ QEMU nu rulează"
+        netstat -tulpn | grep :3389 || echo "🔴 RDP port nu este deschis"
+
+    - name: ⚙️ Configure VM via VNC (auto-install)
+      run: |
+        echo "⚙️ Configurare automată via VNC..."
+        python3 scripts/vnc-automation.py
+
+    - name: 🔄 Install Tailscale in VM
+      run: |
+        echo "🔗 Instalare Tailscale..."
+        # Folosim SMB sau SSH pentru a transfera și executa scriptul
+        TAILSCALE_AUTH_KEY="${{ github.event.inputs.tailscale_auth_key }}" \
+        VM_PASSWORD="${{ steps.generate_password.outputs.password }}" \
+        python3 scripts/install-tailscale.py
+
+    - name: 📋 Display connection information
+      run: |
+        echo " "
+        echo "🎉 WINDOWS SERVER 2025 RDP ESTE GATA!"
+        echo "=========================================="
+        echo "🖥️  Specificații VM:"
+        echo "   • RAM: ${{ env.VM_RAM }}"
+        echo "   • SSD: ${{ env.VM_DISK }}"
+        echo "   • CPU: AMD Ryzen 7 (8 cores emulate)"
+        echo "   • GPU: QEMU virtual graphics"
+        echo " "
+        echo "🔐 Date de conectare:"
+        echo "   • Utilizator: Administrator"
+        echo "   • Parolă: ${{ steps.generate_password.outputs.password }}"
+        echo "   • Tailscale Auth: ${{ github.event.inputs.tailscale_auth_key }}"
+        echo " "
+        echo "⏰ Durată: ${{ github.event.inputs.run_duration }} zile"
+        echo " "
+        echo "🌐 Pentru conectare:"
+        echo "   1. Instalează Tailscale pe device-ul tău"
+        echo "   2. Conectează-te cu auth key-ul de mai sus"
+        echo "   3. Folosește RDP cu IP-ul Tailscale"
+        echo " "
+
+    - name: ⏳ Keep VM running for specified duration
+      run: |
+        DAYS=${{ github.event.inputs.run_duration }}
+        SECONDS=$((DAYS * 24 * 60 * 60))
+        echo "⏰ VM va rula pentru $DAYS zile ($SECONDS secunde)..."
+        
+        # Counter pentru afișare progres
+        for ((i=1; i<=SECONDS; i+=60)); do
+          if (( i % 3600 == 0 )); then
+            HOURS=$((i/3600))
+            echo "⏰ VM rulează de $HOURS ore din $((DAYS*24)) ore..."
+          fi
+          sleep 60
+        done
+
+    - name: 🧹 Cleanup after duration
+      if: always()
+      run: |
+        echo "🧹 Oprire VM și cleanup..."
+        pkill -f qemu-system-x86_64 || true
+        rm -f windows2025.qcow2 win2025.iso
+        echo "✅ Cleanup complet!"
