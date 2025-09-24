@@ -1,0 +1,96 @@
+name: Automatizare completă VM Windows 11 pe server local
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy-and-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Instalează SSH client
+        run: sudo apt-get install -y openssh-client
+
+      - name: Conectare la serverul Linux
+        # Înlocuiește cu IP-ul și userul tău
+        env:
+          SSH_HOST: your.server.ip
+          SSH_USER: youruser
+        run: |
+          ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST << EOF
+
+            # Script complet pentru serverul tău
+
+            # 1. Descărcare ISO
+            wget -O /var/lib/libvirt/images/windows11.iso https://software-download.microsoft.com/sg/Windows11_21H2_English_x64.iso
+
+            # 2. Creare și pornire VM
+            bash -c '
+            DISK_PATH="/var/lib/libvirt/images/win11.qcow2"
+            ISO_PATH="/var/lib/libvirt/images/windows11.iso"
+            VM_NAME="Win11Auto"
+            RAM_MB=32768
+            CPUS=4
+
+            if [ ! -f "$DISK_PATH" ]; then
+              qemu-img create -f qcow2 "$DISK_PATH" 2000G
+            fi
+
+            qemu-system-x86_64 \
+              -name "$VM_NAME" \
+              -m "$RAM_MB" \
+              -smp "$CPUS" \
+              -drive file="$DISK_PATH",format=qcow2 \
+              -cdrom "$ISO_PATH" \
+              -vga virtio \
+              -netdev user,id=net0,hostfwd=tcp::3389-:3389 \
+              -device virtio-net-pci,netdev=net0 \
+              -enable-kvm \
+              -cpu host,kvm=off \
+              -rtc base=localtime \
+              -machine q35,accel=kvm \
+              -display none \
+              -daemonize
+            '
+            echo "VM pornit"
+
+            # 3. Așteaptă Windows să pornească
+            sleep 300
+
+            # 4. Rulează scriptul de colectare info în interiorul VM (dacă ai SSH configurat)
+            # sau manual după ce Windows e gata
+
+            # 5. Așteaptă 6 ore
+            sleep 21600
+
+            # 6. Oprește VM-ul
+            pkill -f qemu-system-x86_64
+            echo "VM oprit"
+
+            # 7. Afișează fișierul cu info (dacă ai preluat anterior)
+            # Poți copia fișierul din VM sau îl poți prelua manual
+          EOF
+Ce trebuie să faci:
+Să ai un server Linux cu QEMU/KVM configurat și acces SSH
+Să adaptezi scriptul pentru IP, user, parola și locația fișierelor
+Să rulezi workflow-ul din GitHub, care va automatiza tot
+Rezumat final:
+Da, se poate face totul automat pe un hypervisor local dacă ai un server Linux cu QEMU/KVM
+Workflow-ul de mai sus face descărcarea ISO, crearea VM, pornirea, și oprirea automat
+Pentru colectare info, trebuie să rulezi scriptul în interiorul VM-ului (manual sau automatizat)
+Vrei să-ți pregătesc un script complet pentru serverul tău?
+Dă-mi detalii despre IP-ul serverului și accesul SSH!
+
+Explain hypervisor setup process
+Provide GitHub Actions example
+Discuss VM configuration options
+Share automation script details
+Explain Windows installation automation
+
+Write your idea here...
+Powered by
+ChatGPT
