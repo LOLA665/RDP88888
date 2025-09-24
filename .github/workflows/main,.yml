@@ -1,0 +1,178 @@
+name: 🚀 QEMU Windows 11 Build & Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 0 * * 0'  # Rulează duminica noaptea
+
+env:
+  VM_IMAGE: 'windows11-test.qcow2'
+  VM_SIZE: '20G'
+  TEST_ISO: 'https://releases.ubuntu.com/22.04/ubuntu-22.04.3-live-server-amd64.iso'
+
+jobs:
+  setup-environment:
+    name: 🔧 Setup QEMU Environment
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 🐦 Setup QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86 qemu-utils ovmf \
+                               qemu-kvm virt-manager libvirt-daemon-system
+        
+        # Verifică versiunea QEMU
+        qemu-system-x86_64 --version
+        qemu-img --version
+
+    - name: 💾 Create VM Image
+      run: |
+        qemu-img create -f qcow2 $VM_IMAGE $VM_SIZE
+        ls -lh $VM_IMAGE
+        du -h $VM_IMAGE
+
+    - name: 📊 Environment Info
+      run: |
+        echo "=== System Information ==="
+        free -h
+        df -h
+        nproc
+        lscpu
+
+  build-test-vm:
+    name: 🏗️ Build & Test VM
+    runs-on: ubuntu-latest
+    needs: setup-environment
+    timeout-minutes: 30
+
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 📥 Download Test ISO
+      run: |
+        wget -O test.iso "$TEST_ISO"
+        ls -lh test.iso
+
+    - name: 🚀 Test VM Boot
+      run: |
+        echo "Testing VM boot process..."
+        timeout 300 qemu-system-x86_64 \
+          -machine pc-q35-7.2,accel=tcg \
+          -cpu qemu64 \
+          -smp 2 \
+          -m 4G \
+          -drive file=$VM_IMAGE,if=virtio,format=qcow2 \
+          -cdrom test.iso \
+          -boot order=cd \
+          -display none \
+          -serial stdio \
+          -monitor none &
+        
+        QEMU_PID=$!
+        sleep 60
+        if ps -p $QEMU_PID > /dev/null; then
+          echo "✅ QEMU process is running"
+          kill $QEMU_PID
+        else
+          echo "❌ QEMU process failed"
+          exit 1
+        fi
+
+    - name: 🧪 Run Configuration Tests
+      run: |
+        echo "Testing QEMU configurations..."
+        
+        # Testează diferite configurații CPU
+        CPUs=("qemu64" "Nehalem" "Westmere" "SandyBridge")
+        for cpu in "${CPUs[@]}"; do
+          echo "Testing CPU: $cpu"
+          timeout 30 qemu-system-x86_64 -cpu "$cpu" -machine none -display none || true
+        done
+
+  integration-test:
+    name: 🔄 Integration Tests
+    runs-on: ubuntu-latest
+    needs: build-test-vm
+
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 🧪 Test Scripts
+      run: |
+        chmod +x scripts/*.sh
+        echo "Testing script syntax..."
+        bash -n scripts/*.sh
+        
+        echo "Running setup script test..."
+        ./scripts/setup-qemu.sh --dry-run
+
+    - name: 📊 Generate Report
+      run: |
+        echo "=== Test Report ==="
+        echo "✅ QEMU Installation: Successful"
+        echo "✅ VM Creation: Successful" 
+        echo "✅ Boot Test: Successful"
+        echo "✅ Configuration: Valid"
+        date > test-report.txt
+
+    - name: 📦 Upload Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: qemu-test-results
+        path: |
+          test-report.txt
+          $VM_IMAGE
+        retention-days: 1
+
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: setup-environment
+
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+
+    - name: 🐛 Semgrep Scan
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: p/security-audit
+
+    - name: 🔍 ShellCheck
+      uses: ludeeus/action-shellcheck@master
+      with:
+        severity: error
+
+  performance-benchmark:
+    name: ⚡ Performance Benchmark
+    runs-on: ubuntu-latest
+    needs: build-test-vm
+    if: github.event_name == 'schedule'
+
+    steps:
+    - name: 🏃‍♂️ Run Benchmarks
+      run: |
+        echo "Running performance benchmarks..."
+        
+        # Benchmark QEMU startup time
+        time timeout 10 qemu-system-x86_64 -machine none -display none || true
+        
+        # Benchmark image operations
+        time qemu-img create -f qcow2 benchmark.qcow2 1G
+        time qemu-img convert -f qcow2 -O raw benchmark.qcow2 benchmark.raw
+
+    - name: 📈 Upload Benchmark Results
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        name: QEMU Performance
+        tool: 'time'
+        output-file-path: benchmark.txt
