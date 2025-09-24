@@ -1,0 +1,105 @@
+name: Windows 11 Emulated Setup with 1TB Dev Drive
+
+on:
+  workflow_dispatch
+
+jobs:
+  setup:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Set fake CPU Name (Intel x-Reon)
+        run: |
+          Set-ItemProperty -Path "HKLM:\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0" -Name "ProcessorNameString" -Value "Intel(R) x-Reon CPU @ 4.00GHz"
+        continue-on-error: true
+
+      - name: Set fake RAM display 32GB
+        run: |
+          New-ItemProperty -Path "HKLM:\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0" -Name "FakePhysicalMemory" -Value "32GB" -PropertyType String -Force
+        continue-on-error: true
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+        continue-on-error: true
+
+      - name: Create RDP user with secure random password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Number = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          echo "RDP_CREDS=User: RDPUser | Password: $password" >> $env:GITHUB_ENV
+        continue-on-error: true
+
+      - name: Connect to Tailscale with auth key
+        run: |
+          & "$env:ProgramFiles\\Tailscale\\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+        continue-on-error: true
+
+      - name: Set up 1TB Dev Drive (VHDX emulat)
+        uses: samypr100/setup-dev-drive@v3
+        with:
+          drive-size: 1TB
+          drive-format: NTFS
+          drive-type: Dynamic
+          drive-path: "C:\\vhds\\dev_drive.vhdx"
+          mount-path: "Z"  
+          workspace-copy: false  
+          native-dev-drive: false
+          trusted-dev-drive: false
+        continue-on-error: true
+
+      - name: Run FPS Fake Display Overlay
+        run: |
+          Add-Type -AssemblyName PresentationFramework
+          $xaml = @"
+          <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                  WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+                  Topmost="True" Left="10" Top="10" Width="120" Height="40" ShowInTaskbar="False">
+            <TextBlock x:Name="fpsText" FontSize="24" Foreground="Lime" FontWeight="Bold" />
+          </Window>
+          "@
+          $reader = New-Object System.Xml.XmlNodeReader([xml]$xaml)
+          $window = [Windows.Markup.XamlReader]::Load($reader)
+          $fpsText = $window.FindName("fpsText")
+          $fpsText.Text = "FPS: 180"
+          $window.Show()
+          while ($true) { Start-Sleep -Seconds 10 }
+        continue-on-error: true
+
+      - name: Output connection info
+        run: |
+          $tsIP = & "$env:ProgramFiles\\Tailscale\\tailscale.exe" ip -4
+          Write-Host "=== Connection Info ==="
+          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "RDP User/Pass: $env:RDP_CREDS"
+          Write-Host "======================="
+        continue-on-error: true
+
+      - name: Keep workflow alive
+        run: |
+          while ($true) {
+            Write-Host "Workflow active..."
+            Start-Sleep -Seconds 300
+          }
+        continue-on-error: true
+        
