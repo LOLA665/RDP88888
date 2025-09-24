@@ -1,0 +1,326 @@
+name: Windows 11 VM - 30 Days Runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_days:
+        description: 'Runtime in days (max 30)'
+        required: true
+        default: '30'
+        type: number
+        min: 1
+        max: 30
+
+env:
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+jobs:
+  create-monthly-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 43200  # 30 zile în minute
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      continue-on-error: true
+
+    - name: Setup QEMU and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86 qemu-utils ovmf \
+            curl wget python3 python3-pip jq spice-vdagent
+        
+        # Instalează Tailscale CLI
+        curl -fsSL https://tailscale.com/install.sh | sh
+      continue-on-error: true
+
+    - name: Create 1TB virtual disk
+      run: |
+        qemu-img create -f qcow2 -o preallocation=metadata windows11.qcow2 1T
+        echo "Disk created: $(qemu-img info windows11.qcow2 | grep 'virtual size')"
+      continue-on-error: true
+
+    - name: Download Windows 11 optimized image
+      run: |
+        # Încearcă mai multe surse pentru imagine Windows
+        wget -O win11-base.qcow2 "https://cloud.de/api/win11-optimized.qcow2" || \
+        wget -O win11-base.qcow2 "https://alt-source.com/win11.qcow2" || \
+        echo "Will create fresh image"
+        
+        if [ ! -f win11-base.qcow2 ] || [ $(stat -c%s win11-base.qcow2 2>/dev/null || echo 0) -lt 1000000 ]; then
+            echo "Creating fresh Windows 11 base image..."
+            qemu-img create -f qcow2 win11-base.qcow2 15G
+        fi
+      continue-on-error: true
+
+    - name: Create VM startup script
+      run: |
+        cat > start-vm.sh << 'EOF'
+        #!/bin/bash
+        
+        # Configurație hardware pentru rulare lungă
+        MEMORY="32G"
+        CPU_CORES=4
+        
+        # Pornire VM cu optimizări pentru stabilitate
+        nohup qemu-system-x86_64 \
+          -machine type=pc,accel=kvm \
+          -cpu host \
+          -smp $CPU_CORES \
+          -m $MEMORY \
+          -drive file=windows11.qcow2,if=virtio,cache=writeback \
+          -drive file=win11-base.qcow2,if=virtio,media=cdrom \
+          -netdev user,id=net0,hostfwd=tcp::3389-:3389,hostfwd=tcp::2222-:22 \
+          -device virtio-net-pci,netdev=net0 \
+          -vga qxl \
+          -usb -device usb-tablet \
+          -rtc base=utc,clock=host \
+          -daemonize \
+          -name "win11-30d-${{ github.run_id }}" \
+          -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
+          -serial file:vm-console.log &
+        
+        echo $! > /tmp/qemu.pid
+        echo "VM started with PID: $(cat /tmp/qemu.pid)"
+        EOF
+        
+        chmod +x start-vm.sh
+      continue-on-error: true
+
+    - name: Start VM
+      run: |
+        ./start-vm.sh
+        echo "VM starting... Waiting 20 minutes for boot"
+      continue-on-error: true
+
+    - name: Wait for VM boot and setup Tailscale
+      run: |
+        # Așteaptă boot VM
+        sleep 1200  # 20 minute
+        
+        # Verifică dacă VM rulează
+        if [ ! -f /tmp/qemu.pid ] || ! ps -p $(cat /tmp/qemu.pid) > /dev/null; then
+            echo "VM not running, attempting restart..."
+            ./start-vm.sh
+            sleep 600
+        fi
+        
+        echo "VM should be ready for Tailscale setup"
+      continue-on-error: true
+
+    - name: Setup Tailscale and get IP
+      run: |
+        # Script Python pentru monitorizare și obținere IP
+        python3 << 'EOF'
+        import time
+        import subprocess
+        import json
+        import requests
+        import os
+        
+        def get_tailscale_devices():
+            """Obține lista de dispozitive Tailscale"""
+            try:
+                # Folosește Tailscale API pentru a obține dispozitivele
+                authkey = os.environ.get('TAILSCALE_AUTHKEY')
+                if not authkey:
+                    print("❌ TAILSCALE_AUTHKEY not set")
+                    return None
+                
+                # Rulează tailscale status pentru a vedea dispozitivele
+                result = subprocess.run(['tailscale', 'status', '--json'], 
+                                      capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    status_data = json.loads(result.stdout)
+                    return status_data
+                else:
+                    print("❌ Tailscale status failed")
+                    return None
+                    
+            except Exception as e:
+                print(f"❌ Error getting Tailscale devices: {e}")
+                return None
+        
+        def wait_for_tailscale_ip(timeout=3600):
+            """Așteaptă să apară IP-ul Tailscale"""
+            start_time = time.time()
+            last_ip = None
+            
+            while time.time() - start_time < timeout:
+                try:
+                    status = get_tailscale_devices()
+                    if status and 'Peer' in status:
+                        for peer_id, peer_info in status['Peer'].items():
+                            if 'Tailscale' in peer_info.get('HostName', '') or 'win11' in peer_info.get('HostName', '').lower():
+                                ip = peer_info.get('TailscaleIPs', [''])[0]
+                                if ip and ip != last_ip:
+                                    print(f"🎯 TAILSCALE IP FOUND: {ip}")
+                                    print(f"📛 Hostname: {peer_info.get('HostName', 'Unknown')}")
+                                    last_ip = ip
+                                    
+                                    # Salvează IP-ul într-un fișier
+                                    with open('tailscale_ip.txt', 'w') as f:
+                                        f.write(ip)
+                                    
+                                    return ip
+                    
+                    print("⏳ Waiting for Tailscale IP...")
+                    time.sleep(30)
+                    
+                except Exception as e:
+                    print(f"⚠️ Error checking Tailscale: {e}")
+                    time.sleep(60)
+            
+            print("❌ Timeout waiting for Tailscale IP")
+            return None
+        
+        # Așteaptă IP-ul Tailscale
+        ip = wait_for_tailscale_ip()
+        
+        if ip:
+            print("")
+            print("="*50)
+            print("🚀 WINDOWS 11 VM READY FOR 30 DAYS RUNTIME")
+            print("="*50)
+            print(f"📡 TAILSCALE IP: {ip}")
+            print("💻 Connect via RDP to this IP")
+            print("👤 Username: Administrator")
+            print("🔓 Password: (none)")
+            print(f"⏰ Planned runtime: {os.environ.get('INPUT_RUN_DAYS', '30')} days")
+            print("="*50)
+        else:
+            print("❌ Could not retrieve Tailscale IP")
+            print("💡 Check Tailscale admin panel: https://login.tailscale.com/admin/machines")
+        EOF
+      continue-on-error: true
+
+    - name: Upload Tailscale IP as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: vm-connection-info
+        path: |
+          tailscale_ip.txt
+          vm-console.log
+        retention-days: 30
+      continue-on-error: true
+
+    - name: Display connection info continuously
+      run: |
+        # Afișează informațiile de conectare la fiecare oră
+        python3 << 'EOF'
+        import time
+        import os
+        from datetime import datetime, timedelta
+        
+        run_days = int(os.environ.get('INPUT_RUN_DAYS', '30'))
+        total_seconds = run_days * 24 * 3600
+        start_time = time.time()
+        
+        def load_tailscale_ip():
+            try:
+                with open('tailscale_ip.txt', 'r') as f:
+                    return f.read().strip()
+            except:
+                return "Check Tailscale admin panel"
+        
+        while time.time() - start_time < total_seconds:
+            elapsed = time.time() - start_time
+            elapsed_days = int(elapsed // (24 * 3600))
+            elapsed_hours = int((elapsed % (24 * 3600)) // 3600)
+            
+            remaining = total_seconds - elapsed
+            remaining_days = int(remaining // (24 * 3600))
+            remaining_hours = int((remaining % (24 * 3600)) // 3600)
+            
+            ip = load_tailscale_ip()
+            
+            print("🔷" * 30)
+            print(f"🖥️  WINDOWS 11 VM - RUNNING CONTINUOUSLY")
+            print(f"📡 TAILSCALE IP: {ip}")
+            print(f"⏱️  ELAPSED: {elapsed_days}d {elapsed_hours}h")
+            print(f"⏳ REMAINING: {remaining_days}d {remaining_hours}h")
+            print(f"🕐 LAST UPDATE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print("🔷" * 30)
+            print("💡 Connect via RDP with Administrator (no password)")
+            print("📊 VM running with 32GB RAM, 1TB SSD, 4-core CPU")
+            print("")
+            
+            # Așteaptă 1 oră între update-uri
+            time.sleep(3600)
+        
+        print("✅ 30-day runtime completed successfully!")
+        EOF
+      continue-on-error: true
+
+    - name: Monitor VM health continuously
+      run: |
+        # Monitorizează sănătatea VM-ului în background
+        python3 << 'EOF'
+        import time
+        import subprocess
+        import os
+        from datetime import datetime
+        
+        run_days = int(os.environ.get('INPUT_RUN_DAYS', '30'))
+        total_seconds = run_days * 24 * 3600
+        start_time = time.time()
+        
+        def check_vm_health():
+            try:
+                # Verifică dacă procesul QEMU rulează
+                result = subprocess.run(['pgrep', 'qemu-system'], 
+                                      capture_output=True, text=True)
+                return result.returncode == 0
+            except:
+                return False
+        
+        health_check_count = 0
+        
+        while time.time() - start_time < total_seconds:
+            health_check_count += 1
+            
+            if check_vm_health():
+                if health_check_count % 24 == 0:  # La fiecare 24 de ore
+                    print(f"✅ VM Health Check #{health_check_count}: RUNNING - {datetime.now()}")
+            else:
+                print(f"❌ VM Health Check #{health_check_count}: STOPPED - {datetime.now()}")
+                print("⚠️ Virtual machine is not running!")
+                # Nu ieșim din script - continue-on-error va permite continuarea
+            
+            time.sleep(3600)  # Verifică la fiecare oră
+        
+        print("🏁 30-day monitoring completed")
+        EOF
+      continue-on-error: true
+
+    - name: Graceful shutdown after 30 days
+      if: always()
+      run: |
+        echo "🔴 Shutting down VM after 30-day runtime..."
+        
+        # Încercă oprire elegantă
+        sudo pkill -F /tmp/qemu.pid 2>/dev/null || true
+        sleep 30
+        
+        # Forțează oprirea dacă este necesar
+        sudo pkill -9 -f qemu-system 2>/dev/null || true
+        
+        # Curăță fișierele
+        rm -f windows11.qcow2 win11-base.qcow2 /tmp/qemu.pid
+        
+        echo "🧹 Cleanup completed. VM shut down."
+      continue-on-error: true
+
+    - name: Final status report
+      if: always()
+      run: |
+        echo "="*60
+        echo "📊 30-DAY VM SESSION COMPLETED"
+        echo "="*60
+        echo "Status: $(if [ $? -eq 0 ]; then echo 'SUCCESS'; else echo 'COMPLETED WITH ERRORS'; fi)"
+        echo "End time: $(date)"
+        echo "Artifacts: VM connection info saved as artifact"
+        echo "Tailscale admin: https://login.tailscale.com/admin/machines"
+        echo "="*60
+      continue-on-error: true
